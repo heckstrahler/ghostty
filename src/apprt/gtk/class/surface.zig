@@ -3133,8 +3133,15 @@ pub const Surface = extern struct {
         self.private().precision_scroll = false;
     }
 
+    /// Returns the key modifiers held during the scroll event currently
+    /// being handled by the given controller, if any.
+    fn scrollEventMods(ec: *gtk.EventControllerScroll) ?input.Mods {
+        const event = ec.as(gtk.EventController).getCurrentEvent() orelse return null;
+        return gtk_key.translateMods(event.getModifierState());
+    }
+
     fn ecMouseScrollVertical(
-        _: *gtk.EventControllerScroll,
+        ec: *gtk.EventControllerScroll,
         x: f64,
         y: f64,
         self: *Self,
@@ -3158,6 +3165,7 @@ pub const Surface = extern struct {
             scaled.x * -1 * multiplier,
             scaled.y * -1 * multiplier,
             scroll_mods,
+            scrollEventMods(ec),
         ) catch |err| {
             log.warn("error in scroll callback err={}", .{err});
             return 0;
@@ -3220,6 +3228,7 @@ pub const Surface = extern struct {
             scaled.x * -1,
             0,
             .{},
+            scrollEventMods(ec),
         ) catch |err| {
             log.warn("error in scroll callback err={}", .{err});
             return @intFromBool(false);

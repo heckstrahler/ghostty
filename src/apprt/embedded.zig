@@ -1078,7 +1078,10 @@ pub const Surface = struct {
         yoff: f64,
         mods: input.ScrollMods,
     ) void {
-        self.core_surface.scrollCallback(xoff, yoff, mods) catch |err| {
+        // The embedded API doesn't provide the key modifiers with scroll
+        // events, so the core uses the modifiers it has tracked from key
+        // and mouse events.
+        self.core_surface.scrollCallback(xoff, yoff, mods, null) catch |err| {
             log.err("error in scroll callback err={}", .{err});
             return;
         };

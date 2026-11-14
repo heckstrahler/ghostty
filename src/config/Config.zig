@@ -38,7 +38,8 @@ const RepeatableStringMap = @import("RepeatableStringMap.zig");
 pub const Path = @import("path.zig").Path;
 pub const RepeatablePath = @import("path.zig").RepeatablePath;
 const ClipboardCodepointMap = @import("ClipboardCodepointMap.zig");
-const KeyRemapSet = @import("../input/key_mods.zig").RemapSet;
+const key_mods = @import("../input/key_mods.zig");
+const KeyRemapSet = key_mods.RemapSet;
 pub const WindowPaddingBalance = @import("../renderer/size.zig").PaddingBalance;
 const string = @import("string.zig");
 const Limit = @import("limit.zig").Limit;
@@ -998,6 +999,29 @@ palette: Palette = .{},
 ///
 /// The default value is "3" for discrete devices and "1" for precision devices.
 @"mouse-scroll-multiplier": MouseScrollMultiplier = .default,
+
+/// Modifier combination that, when held while scrolling the mouse wheel
+/// vertically, changes the font size instead of scrolling. Scrolling up
+/// increases the font size and scrolling down decreases it by 1 point per
+/// wheel notch (touchpads and other precision devices change it once per
+/// cell height of scrolling). This behaves the same as the
+/// `increase_font_size:1` and `decrease_font_size:1` keybind actions, so
+/// `reset_font_size` returns to the configured `font-size`.
+///
+/// While the modifiers are held, scroll events are not scrolled or reported
+/// to the running program, even if it requested mouse reporting.
+///
+/// This is disabled by default (`false`). To enable it, set a modifier
+/// combination, for example:
+///
+///     mouse-scroll-font-size = ctrl+shift
+///
+/// Valid values are `false` (disabled, the default) or one or more of
+/// `shift`, `ctrl`, `alt` and `super` joined by `+`, such as `ctrl+shift` or
+/// `ctrl`. The aliases `control`, `opt`, `option`, `cmd` and `command` are
+/// also accepted. The modifiers must match exactly: with `ctrl+shift`,
+/// scrolling with only `ctrl` held scrolls normally.
+@"mouse-scroll-font-size": MouseScrollFontSize = .disabled,
 
 /// The opacity level (opposite of transparency) of the background. A value of
 /// 1 is fully opaque and a value of 0 is fully transparent. A value less than 0
@@ -9500,6 +9524,150 @@ pub const MouseScrollMultiplier = struct {
         var args: Self = .{ .precision = 1.5, .discrete = 2.5 };
         try args.formatEntry(formatterpkg.entryFormatter("mouse-scroll-multiplier", &buf.writer));
         try testing.expectEqualSlices(u8, "mouse-scroll-multiplier = precision:1.5,discrete:2.5\n", buf.written());
+    }
+};
+
+/// See mouse-scroll-font-size
+pub const MouseScrollFontSize = struct {
+    const Self = @This();
+
+    /// The modifiers that must be held to change the font size with the
+    /// mouse wheel. Null means the feature is disabled. Only the binding
+    /// modifiers (shift, ctrl, alt, super) are ever set.
+    mods: ?inputpkg.Mods = null,
+
+    pub const disabled: MouseScrollFontSize = .{};
+
+    pub fn parseCLI(self: *Self, input_: ?[]const u8) !void {
+        const input = std.mem.trim(
+            u8,
+            input_ orelse return error.ValueRequired,
+            cli.args.whitespace,
+        );
+
+        if (input.len == 0 or std.mem.eql(u8, input, "false")) {
+            self.* = .disabled;
+            return;
+        }
+
+        var mods: inputpkg.Mods = .{};
+        var it = std.mem.splitScalar(u8, input, '+');
+        while (it.next()) |raw| {
+            const part = std.mem.trim(u8, raw, cli.args.whitespace);
+            const mod: key_mods.Mod = mod: {
+                if (std.meta.stringToEnum(key_mods.Mod, part)) |m| break :mod m;
+                for (key_mods.alias) |pair| {
+                    if (std.mem.eql(u8, part, pair[0])) break :mod pair[1];
+                }
+                return error.InvalidValue;
+            };
+
+            switch (mod) {
+                inline else => |tag| {
+                    const field = @tagName(tag);
+                    // Repeating a modifier is an error, same as keybinds.
+                    if (@field(mods, field)) return error.InvalidValue;
+                    @field(mods, field) = true;
+                },
+            }
+        }
+
+        // splitScalar always yields at least one part, so if we got here
+        // without error at least one modifier is set.
+        assert(!mods.empty());
+        self.* = .{ .mods = mods };
+    }
+
+    /// Deep copy of the struct. Required by Config.
+    pub fn clone(self: *const Self, alloc: Allocator) Allocator.Error!Self {
+        _ = alloc;
+        return self.*;
+    }
+
+    /// Compare if two of our value are equal. Required by Config.
+    pub fn equal(self: Self, other: Self) bool {
+        const a = self.mods orelse return other.mods == null;
+        const b = other.mods orelse return false;
+        return a.equal(b);
+    }
+
+    /// Used by Formatter
+    pub fn formatEntry(self: Self, formatter: formatterpkg.EntryFormatter) !void {
+        const mods = self.mods orelse {
+            try formatter.formatEntry(bool, false);
+            return;
+        };
+
+        var buf: [64]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        var first = true;
+        inline for (.{ "shift", "ctrl", "alt", "super" }) |field| {
+            if (@field(mods, field)) {
+                if (!first) writer.writeByte('+') catch return error.OutOfMemory;
+                writer.writeAll(field) catch return error.OutOfMemory;
+                first = false;
+            }
+        }
+        try formatter.formatEntry([]const u8, writer.buffered());
+    }
+
+    test "parse MouseScrollFontSize" {
+        const testing = std.testing;
+
+        var v: Self = .disabled;
+        try testing.expect(v.mods == null);
+
+        try v.parseCLI("ctrl+shift");
+        try testing.expect(v.mods.?.equal(.{ .ctrl = true, .shift = true }));
+
+        try v.parseCLI("ctrl");
+        try testing.expect(v.mods.?.equal(.{ .ctrl = true }));
+
+        try v.parseCLI("command+option");
+        try testing.expect(v.mods.?.equal(.{ .super = true, .alt = true }));
+
+        try v.parseCLI("false");
+        try testing.expect(v.mods == null);
+
+        try v.parseCLI("shift + ctrl");
+        try testing.expect(v.mods.?.equal(.{ .ctrl = true, .shift = true }));
+
+        try v.parseCLI("");
+        try testing.expect(v.mods == null);
+
+        try testing.expectError(error.ValueRequired, v.parseCLI(null));
+        try testing.expectError(error.InvalidValue, v.parseCLI("foo"));
+        try testing.expectError(error.InvalidValue, v.parseCLI("ctrl+a"));
+        try testing.expectError(error.InvalidValue, v.parseCLI("ctrl+ctrl"));
+        try testing.expectError(error.InvalidValue, v.parseCLI("ctrl+"));
+        try testing.expectError(error.InvalidValue, v.parseCLI("true"));
+    }
+
+    test "equal MouseScrollFontSize" {
+        const testing = std.testing;
+        const off: Self = .disabled;
+        const ctrl_shift: Self = .{ .mods = .{ .ctrl = true, .shift = true } };
+        const ctrl_only: Self = .{ .mods = .{ .ctrl = true } };
+        try testing.expect(off.equal(.disabled));
+        try testing.expect(!off.equal(ctrl_shift));
+        try testing.expect(!ctrl_shift.equal(off));
+        try testing.expect(ctrl_shift.equal(ctrl_shift));
+        try testing.expect(!ctrl_shift.equal(ctrl_only));
+    }
+
+    test "format entry MouseScrollFontSize" {
+        const testing = std.testing;
+        var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer buf.deinit();
+
+        const disabled_v: Self = .disabled;
+        try disabled_v.formatEntry(formatterpkg.entryFormatter("mouse-scroll-font-size", &buf.writer));
+        try testing.expectEqualSlices(u8, "mouse-scroll-font-size = false\n", buf.written());
+
+        buf.clearRetainingCapacity();
+        const enabled_v: Self = .{ .mods = .{ .ctrl = true, .shift = true } };
+        try enabled_v.formatEntry(formatterpkg.entryFormatter("mouse-scroll-font-size", &buf.writer));
+        try testing.expectEqualSlices(u8, "mouse-scroll-font-size = shift+ctrl\n", buf.written());
     }
 };
 

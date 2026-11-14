@@ -251,6 +251,10 @@ const Mouse = struct {
     pending_scroll_x: f64 = 0,
     pending_scroll_y: f64 = 0,
 
+    /// Pending vertical scroll amount for mouse-scroll-font-size. This
+    /// is in the same units as the yoff passed to scrollCallback.
+    pending_scroll_font: f64 = 0,
+
     /// True if the mouse is hidden
     hidden: bool = false,
 
@@ -324,6 +328,7 @@ const DerivedConfig = struct {
     mouse_hide_while_typing: bool,
     mouse_reporting: bool,
     mouse_scroll_multiplier: configpkg.MouseScrollMultiplier,
+    mouse_scroll_font_size: ?input.Mods,
     mouse_shift_capture: configpkg.MouseShiftCapture,
     fullscreen: configpkg.Fullscreen,
     macos_non_native_fullscreen: configpkg.NonNativeFullscreen,
@@ -405,6 +410,7 @@ const DerivedConfig = struct {
             .mouse_hide_while_typing = config.@"mouse-hide-while-typing",
             .mouse_reporting = config.@"mouse-reporting",
             .mouse_scroll_multiplier = config.@"mouse-scroll-multiplier",
+            .mouse_scroll_font_size = config.@"mouse-scroll-font-size".mods,
             .mouse_shift_capture = config.@"mouse-shift-capture",
             .fullscreen = config.fullscreen,
             .macos_non_native_fullscreen = config.@"macos-non-native-fullscreen",
@@ -3586,6 +3592,7 @@ pub fn scrollCallback(
     xoff: f64,
     yoff: f64,
     scroll_mods: input.ScrollMods,
+    mods: ?input.Mods,
 ) !void {
     // log.info("SCROLL: xoff={} yoff={} mods={}", .{ xoff, yoff, scroll_mods });
 
@@ -3593,8 +3600,64 @@ pub fn scrollCallback(
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
 
+    // If the apprt gave us the modifier state at the time of the scroll,
+    // update our tracked mods. Our tracked mods can otherwise be stale,
+    // e.g. if modifiers were pressed while another window had focus.
+    if (mods) |v| self.modsChanged(v);
+
     // Always show the mouse again if it is hidden
     if (self.mouse.hidden) self.showMouse();
+
+    // If mouse-scroll-font-size is enabled and the configured modifiers
+    // are held, vertical scrolling changes the font size instead of
+    // scrolling. This is done before any mouse reporting so it works the
+    // same regardless of what the running program requested.
+    if (self.config.mouse_scroll_font_size) |font_mods| font_size: {
+        if (!self.mouse.mods.binding().equal(font_mods)) {
+            // Forget any partial accumulation so the next time the
+            // modifiers are held we start fresh.
+            self.mouse.pending_scroll_font = 0;
+            break :font_size;
+        }
+
+        // Horizontal-only scrolls keep their usual behavior.
+        if (yoff == 0) break :font_size;
+
+        // Discrete devices step once per wheel notch. Precision devices
+        // (touchpads, etc.) report pixels, so require more travel per step
+        // or the font size changes far too quickly.
+        const unit: f64 = if (scroll_mods.precision)
+            @as(f64, @floatFromInt(self.size.cell.height)) * scroll_font_size_precision_cells
+        else
+            1.0;
+
+        // See the comment in the scroll calculation below: macOS reports
+        // slow discrete scrolls with very small magnitudes, so treat any
+        // discrete event as at least one notch.
+        const yoff_adjusted: f64 = if (comptime builtin.target.os.tag.isDarwin() and
+            !scroll_mods.precision)
+            (if (yoff > 0) @max(yoff, 1) else @min(yoff, -1))
+        else
+            yoff;
+
+        // Don't let leftover regular scroll amounts cause a jump once
+        // the modifiers are released.
+        self.mouse.pending_scroll_y = 0;
+
+        const steps = scrollFontSizeSteps(
+            &self.mouse.pending_scroll_font,
+            yoff_adjusted,
+            unit,
+        );
+        if (steps == 0) return;
+
+        const delta: f32 = @floatFromInt(@abs(steps));
+        _ = try self.performBindingAction(if (steps > 0)
+            .{ .increase_font_size = delta }
+        else
+            .{ .decrease_font_size = delta });
+        return;
+    }
 
     const y: ScrollAmount = if (yoff == 0) .{} else y: {
         // We use cell_size to determine if we have accumulated enough to trigger a scroll
@@ -3758,6 +3821,66 @@ pub fn scrollCallback(
     }
 
     try self.queueRender();
+}
+
+/// For precision scroll devices, the number of cell heights of scrolling
+/// required for a single mouse-scroll-font-size step.
+const scroll_font_size_precision_cells: f64 = 5;
+
+/// Accumulate a vertical scroll offset for mouse-scroll-font-size and
+/// return the whole number of font size steps to apply. Positive values
+/// increase the font size, negative values decrease it. Any remainder
+/// smaller than a single unit is kept in `pending`.
+fn scrollFontSizeSteps(pending: *f64, yoff: f64, unit: f64) i32 {
+    assert(unit > 0);
+
+    // If the direction changed, drop the pending amount so that reversing
+    // the wheel takes effect immediately.
+    if ((pending.* > 0 and yoff < 0) or (pending.* < 0 and yoff > 0)) {
+        pending.* = 0;
+    }
+
+    const total = pending.* + yoff;
+    const steps = @trunc(total / unit);
+    pending.* = total - (steps * unit);
+
+    // Font size is clamped to [1, 255] anyways, so clamping here only
+    // avoids overflow in the float to int conversion.
+    return @intFromFloat(std.math.clamp(steps, -255, 255));
+}
+
+test "scrollFontSizeSteps discrete" {
+    const testing = std.testing;
+    var pending: f64 = 0;
+
+    try testing.expectEqual(@as(i32, 1), scrollFontSizeSteps(&pending, 1, 1));
+    try testing.expectEqual(@as(f64, 0), pending);
+    try testing.expectEqual(@as(i32, -1), scrollFontSizeSteps(&pending, -1, 1));
+    try testing.expectEqual(@as(i32, 3), scrollFontSizeSteps(&pending, 3, 1));
+
+    // High resolution wheels report fractional notches.
+    try testing.expectEqual(@as(i32, 0), scrollFontSizeSteps(&pending, 0.5, 1));
+    try testing.expectEqual(@as(i32, 1), scrollFontSizeSteps(&pending, 0.5, 1));
+    try testing.expectEqual(@as(f64, 0), pending);
+
+    // Huge values are clamped.
+    try testing.expectEqual(@as(i32, 255), scrollFontSizeSteps(&pending, 1e30, 1));
+}
+
+test "scrollFontSizeSteps precision" {
+    const testing = std.testing;
+    var pending: f64 = 0;
+
+    try testing.expectEqual(@as(i32, 0), scrollFontSizeSteps(&pending, 30, 100));
+    try testing.expectEqual(@as(i32, 0), scrollFontSizeSteps(&pending, 60, 100));
+    try testing.expectEqual(@as(i32, 1), scrollFontSizeSteps(&pending, 30, 100));
+    try testing.expectApproxEqAbs(@as(f64, 20), pending, 0.0001);
+
+    // Reversing direction drops the pending amount.
+    try testing.expectEqual(@as(i32, 0), scrollFontSizeSteps(&pending, -50, 100));
+    try testing.expectApproxEqAbs(@as(f64, -50), pending, 0.0001);
+    try testing.expectEqual(@as(i32, -2), scrollFontSizeSteps(&pending, -150, 100));
+    try testing.expectApproxEqAbs(@as(f64, 0), pending, 0.0001);
 }
 
 /// This is called when the content scale of the surface changes. The surface
